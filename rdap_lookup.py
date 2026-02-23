@@ -103,14 +103,8 @@ async def fetch_registration_date(
                     continue
                 resp.raise_for_status()
                 return (domain, _parse_registration_date(resp.json()))
-            except httpx.TimeoutException:
-                log.warning("Timeout for %s (attempt %d/%d)", domain, attempt + 1, MAX_RETRIES)
-                await asyncio.sleep(BASE_BACKOFF * (2 ** attempt))
-            except httpx.HTTPStatusError as exc:
-                log.warning("HTTP %d for %s (attempt %d/%d)", exc.response.status_code, domain, attempt + 1, MAX_RETRIES)
-                await asyncio.sleep(BASE_BACKOFF * (2 ** attempt))
-            except httpx.HTTPError as exc:
-                log.warning("Network error for %s: %s (attempt %d/%d)", domain, exc, attempt + 1, MAX_RETRIES)
+            except Exception as exc:
+                log.warning("Error for %s: %s (attempt %d/%d)", domain, type(exc).__name__, attempt + 1, MAX_RETRIES)
                 await asyncio.sleep(BASE_BACKOFF * (2 ** attempt))
     log.error("Failed all %d attempts for %s — skipping", MAX_RETRIES, domain)
     return (domain, None)
@@ -217,7 +211,7 @@ class RDAPWorker:
 
         async with httpx.AsyncClient(
             headers={"Accept": "application/rdap+json, application/json"},
-            http2=True,
+            http2=False,
             limits=httpx.Limits(max_connections=100, max_keepalive_connections=50),
         ) as client:
             if not _tld_to_server:
