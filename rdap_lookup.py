@@ -120,6 +120,10 @@ async def fetch_registration_date(
             if resp.status_code == 404:
                 return (domain, None)
 
+            # 4xx client errors (except 429) = permanent, skip immediately
+            if resp.status_code in (400, 403, 410):
+                return (domain, None)
+
             if resp.status_code == 429:
                 retry_after = float(resp.headers.get("Retry-After", _backoff(attempt)))
                 retry_after = min(retry_after, MAX_BACKOFF)
