@@ -19,7 +19,7 @@ log = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
-DATABASE_URL = os.environ["DATABASE_URL"]
+DATABASE_URL = os.environ.get("DATABASE_URL", "")
 BATCH_SIZE = 1000
 WRITE_BATCH = 500
 CONCURRENCY_PER_SERVER = 5
@@ -163,12 +163,29 @@ class RDAPWorker:
         log.info(msg)
 
     async def _get_pool(self) -> asyncpg.Pool:
+        if not DATABASE_URL:
+            raise RuntimeError("DATABASE_URL environment variable is not set")
         if self._pool is None:
             self._pool = await asyncpg.create_pool(DATABASE_URL, min_size=2, max_size=5)
         return self._pool
 
     async def get_progress(self) -> dict:
-        pool = await self._get_pool()
+        if not DATABASE_URL:
+            return {
+                "running": False, "round": 0, "total": 0, "done": 0,
+                "remaining": 0, "pct": 0, "total_updated_this_session": 0,
+                "rate": 0, "elapsed_min": 0,
+                "error": "DATABASE_URL not set",
+            }
+        try:
+            pool = await self._get_pool()
+        except Exception as e:
+            return {
+                "running": self.running, "round": 0, "total": 0, "done": 0,
+                "remaining": 0, "pct": 0, "total_updated_this_session": 0,
+                "rate": 0, "elapsed_min": 0,
+                "error": str(e),
+            }
         async with pool.acquire() as conn:
             row = await conn.fetchrow(
                 """

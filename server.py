@@ -54,6 +54,8 @@ HTML = """<!DOCTYPE html>
   <div class="card"><div class="label">ETA</div><div class="value" id="eta">-</div></div>
 </div>
 
+<div id="errorBanner" style="display:none; background:#3d1f1f; border:1px solid #f85149; color:#f85149; padding:12px; border-radius:8px; margin-bottom:16px; font-size:0.9rem;"></div>
+
 <div class="controls">
   <button class="btn-start" id="startBtn" onclick="doStart()">Start</button>
   <button class="btn-stop" id="stopBtn" onclick="doStop()" disabled>Stop</button>
@@ -90,6 +92,9 @@ async function refresh() {
     st.className = 'status ' + (d.running ? 'running' : 'stopped');
     document.getElementById('startBtn').disabled = d.running;
     document.getElementById('stopBtn').disabled = !d.running;
+    const errEl = document.getElementById('errorBanner');
+    if (d.error) { errEl.textContent = d.error; errEl.style.display = 'block'; }
+    else { errEl.style.display = 'none'; }
   } catch(e) {}
 }
 
