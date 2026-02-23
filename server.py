@@ -53,7 +53,7 @@ HTML = """<!DOCTYPE html>
   @keyframes shimmer { 0% { background-position: 200% 0; } 100% { background-position: -200% 0; } }
 
   /* Stats grid */
-  .stats { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; margin-bottom: 40px; }
+  .stats { display: grid; grid-template-columns: repeat(4, 1fr); gap: 16px; margin-bottom: 40px; }
   @media (max-width: 700px) { .stats { grid-template-columns: 1fr 1fr; } }
   .stat { background: var(--surface); border: 1px solid var(--border); border-radius: 16px; padding: 24px; }
   .stat .label { font-size: 0.75rem; font-weight: 600; color: var(--muted); text-transform: uppercase; letter-spacing: 0.08em; margin-bottom: 8px; }
@@ -110,6 +110,8 @@ HTML = """<!DOCTYPE html>
     <div class="stat"><div class="label">Speed</div><div class="val accent-purple" id="rate">-</div></div>
     <div class="stat"><div class="label">Session Writes</div><div class="val" id="session">-</div></div>
     <div class="stat"><div class="label">ETA</div><div class="val accent-amber" id="eta">-</div></div>
+    <div class="stat"><div class="label">Round</div><div class="val" id="round">-</div></div>
+    <div class="stat"><div class="label">Auto-Restarts</div><div class="val" id="crashes">0</div></div>
   </div>
 
   <div id="errorBanner" class="error-banner"></div>
@@ -149,6 +151,8 @@ async function refresh() {
     document.getElementById('rate').textContent = d.rate ? d.rate + '/s' : '-';
     document.getElementById('session').textContent = fmt(d.total_updated_this_session);
     document.getElementById('eta').textContent = formatETA(d.remaining, d.rate);
+    document.getElementById('round').textContent = d.round || '-';
+    document.getElementById('crashes').textContent = d.crash_count || '0';
     const pct = d.pct || 0;
     document.getElementById('bar').style.width = pct + '%';
     document.getElementById('pctNum').textContent = pct.toFixed(1);
