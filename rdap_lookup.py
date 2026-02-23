@@ -2,8 +2,9 @@ import asyncio
 import logging
 import os
 import sys
+import time
+from collections import deque
 from datetime import datetime, timezone
-from urllib.parse import urlparse
 
 import asyncpg
 import httpx
@@ -19,50 +20,43 @@ log = logging.getLogger(__name__)
 # Config
 # ---------------------------------------------------------------------------
 DATABASE_URL = os.environ["DATABASE_URL"]
-BATCH_SIZE = 1000            # domains fetched per DB round-trip
-WRITE_BATCH = 500            # results buffered before flushing to DB
-CONCURRENCY_PER_SERVER = 5   # max parallel requests per RDAP server
+BATCH_SIZE = 1000
+WRITE_BATCH = 500
+CONCURRENCY_PER_SERVER = 5
 MAX_RETRIES = 3
-BASE_BACKOFF = 2.0           # seconds, doubled each retry
-REQUEST_TIMEOUT = 30.0       # seconds per RDAP request
+BASE_BACKOFF = 2.0
+REQUEST_TIMEOUT = 30.0
 IANA_BOOTSTRAP_URL = "https://data.iana.org/rdap/dns.json"
 
 # ---------------------------------------------------------------------------
-# RDAP bootstrap — maps TLD -> RDAP base URL
+# RDAP bootstrap
 # ---------------------------------------------------------------------------
 _tld_to_server: dict[str, str] = {}
 _server_semaphores: dict[str, asyncio.Semaphore] = {}
 
 
 async def load_bootstrap(client: httpx.AsyncClient) -> None:
-    """Fetch IANA bootstrap file and build TLD -> RDAP server mapping."""
     log.info("Fetching IANA RDAP bootstrap from %s", IANA_BOOTSTRAP_URL)
     resp = await client.get(IANA_BOOTSTRAP_URL, timeout=30)
     resp.raise_for_status()
     data = resp.json()
-
     for entry in data.get("services", []):
         tlds, urls = entry
-        # Pick the first HTTPS URL
         server_url = next((u for u in urls if u.startswith("https://")), urls[0])
         server_url = server_url.rstrip("/")
         for tld in tlds:
             _tld_to_server[tld.lower()] = server_url
-
     log.info("Loaded RDAP servers for %d TLDs", len(_tld_to_server))
 
 
 def get_rdap_server(domain: str) -> str | None:
-    """Return the RDAP base URL for a domain's TLD, or None if unknown."""
     parts = domain.rsplit(".", 1)
     if len(parts) < 2:
         return None
-    tld = parts[1].lower()
-    return _tld_to_server.get(tld)
+    return _tld_to_server.get(parts[1].lower())
 
 
 def _get_semaphore(server_url: str) -> asyncio.Semaphore:
-    """Get or create a per-server semaphore for rate limiting."""
     if server_url not in _server_semaphores:
         _server_semaphores[server_url] = asyncio.Semaphore(CONCURRENCY_PER_SERVER)
     return _server_semaphores[server_url]
@@ -72,9 +66,7 @@ def _get_semaphore(server_url: str) -> asyncio.Semaphore:
 # RDAP lookup
 # ---------------------------------------------------------------------------
 def _parse_registration_date(data: dict) -> datetime | None:
-    """Extract registration date from RDAP JSON response."""
     events = data.get("events", [])
-    # Primary: look for "registration" event
     for ev in events:
         action = ev.get("eventAction", "").lower()
         if action == "registration":
@@ -82,8 +74,6 @@ def _parse_registration_date(data: dict) -> datetime | None:
                 return datetime.fromisoformat(ev["eventDate"].replace("Z", "+00:00"))
             except (KeyError, ValueError):
                 continue
-
-    # Fallback: some servers use variant names
     fallback_actions = {"last changed of registration", "registrationdate"}
     for ev in events:
         action = ev.get("eventAction", "").lower()
@@ -92,37 +82,27 @@ def _parse_registration_date(data: dict) -> datetime | None:
                 return datetime.fromisoformat(ev["eventDate"].replace("Z", "+00:00"))
             except (KeyError, ValueError):
                 continue
-
     return None
 
 
 async def fetch_registration_date(
-    client: httpx.AsyncClient,
-    domain: str,
-    server_url: str,
+    client: httpx.AsyncClient, domain: str, server_url: str,
 ) -> tuple[str, datetime | None]:
-    """Query RDAP for a single domain. Returns (domain, registration_date|None)."""
     sem = _get_semaphore(server_url)
     url = f"{server_url}/domain/{domain}"
-
     for attempt in range(MAX_RETRIES):
         async with sem:
             try:
                 resp = await client.get(url, timeout=REQUEST_TIMEOUT, follow_redirects=True)
-
                 if resp.status_code == 404:
                     return (domain, None)
-
                 if resp.status_code == 429:
                     retry_after = float(resp.headers.get("Retry-After", BASE_BACKOFF * (2 ** attempt)))
                     log.warning("429 from %s for %s — backing off %.1fs", server_url, domain, retry_after)
                     await asyncio.sleep(retry_after)
                     continue
-
                 resp.raise_for_status()
-                reg_date = _parse_registration_date(resp.json())
-                return (domain, reg_date)
-
+                return (domain, _parse_registration_date(resp.json()))
             except httpx.TimeoutException:
                 log.warning("Timeout for %s (attempt %d/%d)", domain, attempt + 1, MAX_RETRIES)
                 await asyncio.sleep(BASE_BACKOFF * (2 ** attempt))
@@ -132,19 +112,11 @@ async def fetch_registration_date(
             except httpx.HTTPError as exc:
                 log.warning("Network error for %s: %s (attempt %d/%d)", domain, exc, attempt + 1, MAX_RETRIES)
                 await asyncio.sleep(BASE_BACKOFF * (2 ** attempt))
-
     log.error("Failed all %d attempts for %s — skipping", MAX_RETRIES, domain)
     return (domain, None)
 
 
-# ---------------------------------------------------------------------------
-# Batch processing
-# ---------------------------------------------------------------------------
-async def process_batch(
-    client: httpx.AsyncClient,
-    domains: list[str],
-) -> list[tuple[str, datetime]]:
-    """Look up registration dates for a batch of domains in parallel."""
+async def process_batch(client: httpx.AsyncClient, domains: list[str]) -> list[tuple[str, datetime]]:
     tasks = []
     skipped = 0
     for domain in domains:
@@ -153,22 +125,16 @@ async def process_batch(
             skipped += 1
             continue
         tasks.append(fetch_registration_date(client, domain, server))
-
     if skipped:
         log.info("Skipped %d domains with no known RDAP server", skipped)
-
     results = await asyncio.gather(*tasks)
-    # Only return domains where we got an actual date
     return [(domain, dt) for domain, dt in results if dt is not None]
 
 
 async def update_db(pool: asyncpg.Pool, results: list[tuple[str, datetime]]) -> int:
-    """Batch-update registered_at for resolved domains."""
     if not results:
         return 0
-
     async with pool.acquire() as conn:
-        # Use executemany for batch update
         await conn.executemany(
             "UPDATE global_domains SET registered_at = $1 WHERE name = $2",
             [(dt, domain) for domain, dt in results],
@@ -177,76 +143,133 @@ async def update_db(pool: asyncpg.Pool, results: list[tuple[str, datetime]]) -> 
 
 
 # ---------------------------------------------------------------------------
-# Main loop
+# Worker — controllable background task
 # ---------------------------------------------------------------------------
-async def main() -> None:
-    log.info("Starting RDAP domain registration date lookup")
+class RDAPWorker:
+    def __init__(self) -> None:
+        self.running = False
+        self.task: asyncio.Task | None = None
+        self.round_num = 0
+        self.total_updated = 0
+        self.started_at: float | None = None
+        self.logs: deque[str] = deque(maxlen=200)
+        self.rate: float = 0.0  # domains/sec
+        self._pool: asyncpg.Pool | None = None
 
-    # Connection pool to Neon
-    pool = await asyncpg.create_pool(DATABASE_URL, min_size=2, max_size=5)
+    def _log(self, msg: str) -> None:
+        ts = datetime.now(timezone.utc).strftime("%H:%M:%S")
+        entry = f"[{ts}] {msg}"
+        self.logs.append(entry)
+        log.info(msg)
 
-    async with httpx.AsyncClient(
-        headers={"Accept": "application/rdap+json, application/json"},
-        http2=True,
-        limits=httpx.Limits(max_connections=100, max_keepalive_connections=50),
-    ) as client:
-        await load_bootstrap(client)
+    async def _get_pool(self) -> asyncpg.Pool:
+        if self._pool is None:
+            self._pool = await asyncpg.create_pool(DATABASE_URL, min_size=2, max_size=5)
+        return self._pool
 
-        total_updated = 0
-        round_num = 0
-
-        while True:
-            round_num += 1
-
-            # Fetch next batch of domains with no registration date
-            async with pool.acquire() as conn:
-                rows = await conn.fetch(
-                    "SELECT name FROM global_domains WHERE registered_at IS NULL LIMIT $1",
-                    BATCH_SIZE,
-                )
-
-            if not rows:
-                log.info("No more domains to process — all done!")
-                break
-
-            domains = [r["name"] for r in rows]
-            log.info("Round %d: processing %d domains", round_num, len(domains))
-
-            # Process in sub-batches for write flushing
-            all_results: list[tuple[str, datetime]] = []
-            for i in range(0, len(domains), WRITE_BATCH):
-                chunk = domains[i : i + WRITE_BATCH]
-                results = await process_batch(client, chunk)
-                all_results.extend(results)
-
-            written = await update_db(pool, all_results)
-            total_updated += written
-
-            # Progress report
-            async with pool.acquire() as conn:
-                row = await conn.fetchrow(
-                    """
-                    SELECT count(*) AS total,
-                           count(registered_at) AS done,
-                           count(*) - count(registered_at) AS remaining
-                    FROM global_domains
-                    """
-                )
-
-            pct = (row["done"] / row["total"] * 100) if row["total"] else 0
-            log.info(
-                "Round %d complete: wrote %d | total done: %d/%d (%.1f%%) | remaining: %d",
-                round_num,
-                written,
-                row["done"],
-                row["total"],
-                pct,
-                row["remaining"],
+    async def get_progress(self) -> dict:
+        pool = await self._get_pool()
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT count(*) AS total,
+                       count(registered_at) AS done,
+                       count(*) - count(registered_at) AS remaining
+                FROM global_domains
+                """
             )
+        total, done, remaining = row["total"], row["done"], row["remaining"]
+        pct = round(done / total * 100, 2) if total else 0
+        elapsed = time.time() - self.started_at if self.started_at and self.running else 0
+        return {
+            "running": self.running,
+            "round": self.round_num,
+            "total": total,
+            "done": done,
+            "remaining": remaining,
+            "pct": pct,
+            "total_updated_this_session": self.total_updated,
+            "rate": round(self.rate, 1),
+            "elapsed_min": round(elapsed / 60, 1),
+        }
 
-    await pool.close()
-    log.info("Finished. Total updated: %d", total_updated)
+    async def _run(self) -> None:
+        self._log("Worker starting")
+        self.started_at = time.time()
+        pool = await self._get_pool()
+
+        async with httpx.AsyncClient(
+            headers={"Accept": "application/rdap+json, application/json"},
+            http2=True,
+            limits=httpx.Limits(max_connections=100, max_keepalive_connections=50),
+        ) as client:
+            if not _tld_to_server:
+                await load_bootstrap(client)
+
+            while self.running:
+                self.round_num += 1
+                round_start = time.time()
+
+                async with pool.acquire() as conn:
+                    rows = await conn.fetch(
+                        "SELECT name FROM global_domains WHERE registered_at IS NULL LIMIT $1",
+                        BATCH_SIZE,
+                    )
+
+                if not rows:
+                    self._log("No more domains to process — all done!")
+                    self.running = False
+                    break
+
+                domains = [r["name"] for r in rows]
+                self._log(f"Round {self.round_num}: processing {len(domains)} domains")
+
+                all_results: list[tuple[str, datetime]] = []
+                for i in range(0, len(domains), WRITE_BATCH):
+                    if not self.running:
+                        break
+                    chunk = domains[i : i + WRITE_BATCH]
+                    results = await process_batch(client, chunk)
+                    all_results.extend(results)
+
+                written = await update_db(pool, all_results)
+                self.total_updated += written
+
+                elapsed = time.time() - round_start
+                self.rate = len(domains) / elapsed if elapsed > 0 else 0
+
+                self._log(
+                    f"Round {self.round_num} done: wrote {written} | "
+                    f"session total: {self.total_updated} | "
+                    f"rate: {self.rate:.1f} domains/s"
+                )
+
+        self._log("Worker stopped")
+
+    def start(self) -> bool:
+        if self.running:
+            return False
+        self.running = True
+        self.round_num = 0
+        self.total_updated = 0
+        self.task = asyncio.create_task(self._safe_run())
+        return True
+
+    async def _safe_run(self) -> None:
+        try:
+            await self._run()
+        except Exception as e:
+            self._log(f"Worker crashed: {e}")
+            log.exception("Worker crashed")
+        finally:
+            self.running = False
+
+    def stop(self) -> bool:
+        if not self.running:
+            return False
+        self.running = False
+        self._log("Stop requested — finishing current batch")
+        return True
 
 
-if __name__ == "__main__":
-    asyncio.run(main())
+worker = RDAPWorker()
