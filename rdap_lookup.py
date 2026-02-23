@@ -62,11 +62,18 @@ async def load_bootstrap(client: httpx.AsyncClient) -> None:
     raise RuntimeError("Failed to load IANA RDAP bootstrap after 5 attempts")
 
 
+# TLDs to skip entirely (broken RDAP servers or irrelevant)
+SKIP_TLDS = {"gov", "mil", "edu", "int"}
+
+
 def get_rdap_server(domain: str) -> str | None:
     parts = domain.rsplit(".", 1)
     if len(parts) < 2:
         return None
-    return _tld_to_server.get(parts[1].lower())
+    tld = parts[1].lower()
+    if tld in SKIP_TLDS:
+        return None
+    return _tld_to_server.get(tld)
 
 
 def _get_semaphore(server_url: str) -> asyncio.Semaphore:
