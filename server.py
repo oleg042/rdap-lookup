@@ -104,14 +104,14 @@ HTML = """<!DOCTYPE html>
   </div>
 
   <div class="stats">
-    <div class="stat"><div class="label">Completed</div><div class="val accent-green" id="done">-</div></div>
+    <div class="stat"><div class="label">Dates Found</div><div class="val accent-green" id="done">-</div></div>
+    <div class="stat"><div class="label">Checked</div><div class="val accent-blue" id="checked">-</div></div>
     <div class="stat"><div class="label">Remaining</div><div class="val" id="remaining">-</div></div>
-    <div class="stat"><div class="label">Total Domains</div><div class="val accent-blue" id="total">-</div></div>
+    <div class="stat"><div class="label">Total Domains</div><div class="val" id="total">-</div></div>
     <div class="stat"><div class="label">Speed</div><div class="val accent-purple" id="rate">-</div></div>
     <div class="stat"><div class="label">Session Writes</div><div class="val" id="session">-</div></div>
     <div class="stat"><div class="label">ETA</div><div class="val accent-amber" id="eta">-</div></div>
     <div class="stat"><div class="label">Round</div><div class="val" id="round">-</div></div>
-    <div class="stat"><div class="label">Auto-Restarts</div><div class="val" id="crashes">0</div></div>
   </div>
 
   <div id="errorBanner" class="error-banner"></div>
@@ -146,13 +146,13 @@ async function refresh() {
     const r = await fetch('/api/status');
     const d = await r.json();
     document.getElementById('done').textContent = fmt(d.done);
+    document.getElementById('checked').textContent = fmt(d.checked);
     document.getElementById('remaining').textContent = fmt(d.remaining);
     document.getElementById('total').textContent = fmt(d.total);
     document.getElementById('rate').textContent = d.rate ? d.rate + '/s' : '-';
     document.getElementById('session').textContent = fmt(d.total_updated_this_session);
     document.getElementById('eta').textContent = formatETA(d.remaining, d.rate);
     document.getElementById('round').textContent = d.round || '-';
-    document.getElementById('crashes').textContent = d.crash_count || '0';
     const pct = d.pct || 0;
     document.getElementById('bar').style.width = pct + '%';
     document.getElementById('pctNum').textContent = pct.toFixed(1);

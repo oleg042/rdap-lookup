@@ -160,49 +160,64 @@ async def fetch_registration_date(
     return (domain, None)
 
 
-async def process_batch(client: httpx.AsyncClient, domains: list[str]) -> list[tuple[str, datetime]]:
+async def process_batch(
+    client: httpx.AsyncClient, domains: list[str],
+) -> tuple[list[tuple[str, datetime]], list[str]]:
+    """Return (found, all_checked) — found has dates, all_checked is every domain we looked up."""
     tasks = []
-    skipped = 0
+    skipped_domains: list[str] = []
     for domain in domains:
         server = get_rdap_server(domain)
         if server is None:
-            skipped += 1
+            skipped_domains.append(domain)
             continue
         tasks.append(fetch_registration_date(client, domain, server))
-    if skipped:
-        log.info("Skipped %d domains with no known RDAP server", skipped)
+    if skipped_domains:
+        log.info("Skipped %d domains with no known RDAP server", len(skipped_domains))
     if not tasks:
-        return []
+        return [], skipped_domains
     results = await asyncio.gather(*tasks, return_exceptions=True)
-    # Filter out any exceptions that somehow slipped through
-    good = []
+    found = []
+    checked = list(skipped_domains)
     for r in results:
         if isinstance(r, Exception):
             log.warning("Unexpected gather exception: %s", r)
             continue
         domain, dt = r
+        checked.append(domain)
         if dt is not None:
-            good.append((domain, dt))
-    return good
+            found.append((domain, dt))
+    return found, checked
 
 
-async def update_db(pool: asyncpg.Pool, results: list[tuple[str, datetime]]) -> int:
-    """Batch-update with retry on DB connection errors."""
-    if not results:
+async def update_db(
+    pool: asyncpg.Pool,
+    found: list[tuple[str, datetime]],
+    all_checked: list[str],
+) -> int:
+    """Batch-update: set registered_at for found, rdap_checked_at for all checked."""
+    if not all_checked:
         return 0
+    now = datetime.now(timezone.utc)
     for attempt in range(5):
         try:
             async with pool.acquire() as conn:
-                await conn.executemany(
-                    "UPDATE global_domains SET registered_at = $1 WHERE name = $2",
-                    [(dt, domain) for domain, dt in results],
-                )
-            return len(results)
+                async with conn.transaction():
+                    if found:
+                        await conn.executemany(
+                            "UPDATE global_domains SET registered_at = $1 WHERE name = $2",
+                            [(dt, domain) for domain, dt in found],
+                        )
+                    await conn.executemany(
+                        "UPDATE global_domains SET rdap_checked_at = $1 WHERE name = $2",
+                        [(now, domain) for domain in all_checked],
+                    )
+            return len(found)
         except Exception as exc:
             delay = _backoff(attempt)
             log.warning("DB write failed: %s — retrying in %.1fs (attempt %d/5)", exc, delay, attempt + 1)
             await asyncio.sleep(delay)
-    log.error("DB write failed after 5 attempts — dropping %d results", len(results))
+    log.error("DB write failed after 5 attempts — dropping %d results", len(all_checked))
     return 0
 
 
@@ -264,25 +279,28 @@ class RDAPWorker:
                     """
                     SELECT count(*) AS total,
                            count(registered_at) AS done,
-                           count(*) - count(registered_at) AS remaining
+                           count(rdap_checked_at) AS checked,
+                           count(*) - count(rdap_checked_at) AS remaining
                     FROM global_domains
                     """
                 )
         except Exception as e:
             return {
                 "running": self.running, "round": self.round_num, "total": 0, "done": 0,
-                "remaining": 0, "pct": 0, "total_updated_this_session": self.total_updated,
+                "checked": 0, "remaining": 0, "pct": 0,
+                "total_updated_this_session": self.total_updated,
                 "rate": self.rate, "elapsed_min": 0, "crash_count": self.crash_count,
                 "error": str(e),
             }
-        total, done, remaining = row["total"], row["done"], row["remaining"]
-        pct = round(done / total * 100, 2) if total else 0
+        total, done, checked, remaining = row["total"], row["done"], row["checked"], row["remaining"]
+        pct = round(checked / total * 100, 2) if total else 0
         elapsed = time.time() - self.started_at if self.started_at and self.running else 0
         return {
             "running": self.running,
             "round": self.round_num,
             "total": total,
             "done": done,
+            "checked": checked,
             "remaining": remaining,
             "pct": pct,
             "total_updated_this_session": self.total_updated,
@@ -316,7 +334,7 @@ class RDAPWorker:
                         pool = await self._get_pool()
                         async with pool.acquire() as conn:
                             rows = await conn.fetch(
-                                "SELECT name FROM global_domains WHERE registered_at IS NULL LIMIT $1",
+                                "SELECT name FROM global_domains WHERE rdap_checked_at IS NULL LIMIT $1",
                                 BATCH_SIZE,
                             )
                         break
@@ -338,22 +356,24 @@ class RDAPWorker:
                 domains = [r["name"] for r in rows]
                 self._log(f"Round {self.round_num}: processing {len(domains)} domains")
 
-                all_results: list[tuple[str, datetime]] = []
+                all_found: list[tuple[str, datetime]] = []
+                all_checked: list[str] = []
                 for i in range(0, len(domains), WRITE_BATCH):
                     if not self.running:
                         break
                     chunk = domains[i : i + WRITE_BATCH]
-                    results = await process_batch(client, chunk)
-                    all_results.extend(results)
+                    found, checked = await process_batch(client, chunk)
+                    all_found.extend(found)
+                    all_checked.extend(checked)
 
-                written = await update_db(pool, all_results)
+                written = await update_db(pool, all_found, all_checked)
                 self.total_updated += written
 
                 elapsed = time.time() - round_start
                 self.rate = len(domains) / elapsed if elapsed > 0 else 0
 
                 self._log(
-                    f"Round {self.round_num} done: wrote {written}/{len(domains)} | "
+                    f"Round {self.round_num} done: {written} found / {len(all_checked)} checked / {len(domains)} fetched | "
                     f"session total: {self.total_updated} | "
                     f"rate: {self.rate:.1f} domains/s"
                 )
