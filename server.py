@@ -1,10 +1,15 @@
 import asyncio
+import logging
 import os
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, JSONResponse
 
 from rdap_lookup import worker
+
+# Silence noisy websockets/uvicorn stderr logs (they show up red but aren't errors)
+logging.getLogger("websockets").setLevel(logging.WARNING)
+logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
 
 app = FastAPI(title="RDAP Lookup Monitor")
 
@@ -90,6 +95,19 @@ HTML = """<!DOCTYPE html>
   .logs::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
   .logs div { color: var(--muted); white-space: nowrap; }
   .logs div:nth-last-child(-n+3) { color: var(--text); }
+
+  /* Activity ticker */
+  .activity-section { margin-bottom: 40px; }
+  .activity-section h2 { font-size: 1rem; font-weight: 700; color: var(--muted); margin-bottom: 12px; text-transform: uppercase; letter-spacing: 0.06em; }
+  .activity { background: var(--surface); border: 1px solid var(--border); border-radius: 16px; padding: 16px 20px; height: 180px; overflow-y: auto; font-family: 'JetBrains Mono', monospace; font-size: 0.75rem; line-height: 1.7; }
+  .activity::-webkit-scrollbar { width: 6px; }
+  .activity::-webkit-scrollbar-track { background: transparent; }
+  .activity::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+  .activity div { white-space: nowrap; }
+  .activity .s200 { color: var(--green); }
+  .activity .s404 { color: #52525b; }
+  .activity .s429 { color: var(--amber); }
+  .activity .sother { color: var(--muted); }
 </style>
 </head>
 <body>
@@ -125,6 +143,11 @@ HTML = """<!DOCTYPE html>
   <div class="controls">
     <button class="btn btn-start" id="startBtn" onclick="doStart()">Start Lookup</button>
     <button class="btn btn-stop" id="stopBtn" onclick="doStop()" disabled>Stop</button>
+  </div>
+
+  <div class="activity-section">
+    <h2>Live Activity</h2>
+    <div class="activity" id="activity"></div>
   </div>
 
   <div class="logs-section">
@@ -177,6 +200,20 @@ function updateLogs(logs) {
   if (atBottom) el.scrollTop = el.scrollHeight;
 }
 
+function updateActivity(items) {
+  const el = document.getElementById('activity');
+  const atBottom = el.scrollTop + el.clientHeight >= el.scrollHeight - 30;
+  el.innerHTML = items.map(item => {
+    const code = item.split(' · ')[1] || '';
+    let cls = 'sother';
+    if (code === '200') cls = 's200';
+    else if (code === '404') cls = 's404';
+    else if (code === '429') cls = 's429';
+    return '<div class="' + cls + '">' + item + '</div>';
+  }).join('');
+  if (atBottom) el.scrollTop = el.scrollHeight;
+}
+
 /* ---------- WebSocket with polling fallback ---------- */
 let ws = null;
 let wsConnected = false;
@@ -208,6 +245,7 @@ function connectWS() {
       const msg = JSON.parse(e.data);
       if (msg.status) updateStatus(msg.status);
       if (msg.logs) updateLogs(msg.logs);
+      if (msg.activity) updateActivity(msg.activity);
     } catch(err) {}
   };
 
@@ -234,6 +272,7 @@ async function pollLogs() {
     const r = await fetch('/api/logs');
     const d = await r.json();
     updateLogs(d.logs);
+    if (d.activity) updateActivity(d.activity);
   } catch(e) {}
 }
 
@@ -284,7 +323,11 @@ async def websocket_endpoint(websocket: WebSocket):
         while True:
             status_data = await worker.get_progress()
             logs_data = list(worker.logs)
-            await websocket.send_json({"status": status_data, "logs": logs_data})
+            await websocket.send_json({
+                "status": status_data,
+                "logs": logs_data,
+                "activity": list(worker.recent_activity),
+            })
             await asyncio.sleep(1.5)
     except WebSocketDisconnect:
         pass
@@ -301,7 +344,7 @@ async def status():
 
 @app.get("/api/logs")
 async def logs():
-    return JSONResponse({"logs": list(worker.logs)})
+    return JSONResponse({"logs": list(worker.logs), "activity": list(worker.recent_activity)})
 
 
 @app.post("/api/start")

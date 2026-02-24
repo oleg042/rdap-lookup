@@ -22,8 +22,8 @@ log = logging.getLogger(__name__)
 # Config
 # ---------------------------------------------------------------------------
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
-BATCH_SIZE = 500
-WRITE_BATCH = 250
+BATCH_SIZE = 50
+WRITE_BATCH = 50
 MAX_RETRIES = 10
 MAX_429_RETRIES = 3           # give up on a domain after 3 rate-limit hits
 BASE_BACKOFF = 1.0           # first retry after ~1s
@@ -157,6 +157,9 @@ class _RateLimiter:
 
 _rate_limiters: dict[str, _RateLimiter] = {}
 
+# Live activity feed — recent individual lookup results
+_recent_activity: deque[str] = deque(maxlen=30)
+
 
 def _get_rate_limiter(server_url: str) -> _RateLimiter:
     if server_url not in _rate_limiters:
@@ -213,6 +216,8 @@ async def fetch_registration_date(
         try:
             async with limiter:
                 resp = await client.get(url, timeout=REQUEST_TIMEOUT, follow_redirects=True)
+
+            _recent_activity.append(f"{domain} · {resp.status_code}")
 
             if resp.status_code == 404:
                 return (domain, None)
@@ -329,6 +334,7 @@ class RDAPWorker:
         self.total_updated = 0
         self.started_at: float | None = None
         self.logs: deque[str] = deque(maxlen=500)
+        self.recent_activity = _recent_activity
         self.rate: float = 0.0
         self.crash_count = 0
         self._pool: asyncpg.Pool | None = None
@@ -379,6 +385,7 @@ class RDAPWorker:
                            count(rdap_checked_at) AS checked,
                            count(*) - count(rdap_checked_at) AS remaining
                     FROM global_domains
+                    WHERE redirect_id IS NOT NULL
                     """
                 )
         except Exception as e:
@@ -431,7 +438,7 @@ class RDAPWorker:
                         pool = await self._get_pool()
                         async with pool.acquire() as conn:
                             rows = await conn.fetch(
-                                "SELECT name FROM global_domains WHERE rdap_checked_at IS NULL LIMIT $1",
+                                "SELECT name FROM global_domains WHERE rdap_checked_at IS NULL AND redirect_id IS NOT NULL LIMIT $1",
                                 BATCH_SIZE,
                             )
                         break
