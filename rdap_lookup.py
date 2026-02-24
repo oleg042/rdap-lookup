@@ -25,7 +25,8 @@ DATABASE_URL = os.environ.get("DATABASE_URL", "")
 BATCH_SIZE = 50
 WRITE_BATCH = 50
 MAX_RETRIES = 10
-MAX_429_RETRIES = 3           # give up on a domain after 3 rate-limit hits
+MAX_429_RETRIES = 8           # give up on a domain after 8 rate-limit hits
+_429_BACKOFF_STEPS = [1, 3, 5, 10, 10, 10, 30, 60]  # seconds between 429 retries
 BASE_BACKOFF = 1.0           # first retry after ~1s
 MAX_BACKOFF = 120.0           # cap at 2 minutes
 REQUEST_TIMEOUT = 45.0
@@ -157,6 +158,9 @@ class _RateLimiter:
 
 _rate_limiters: dict[str, _RateLimiter] = {}
 
+# Sentinel: domain was rate-limited, don't mark as checked
+_RATE_LIMITED = object()
+
 # Live activity feed — recent individual lookup results
 _recent_activity: deque[str] = deque(maxlen=30)
 
@@ -184,19 +188,10 @@ def _backoff(attempt: int) -> float:
 # ---------------------------------------------------------------------------
 # RDAP lookup
 # ---------------------------------------------------------------------------
-def _parse_registration_date(data: dict) -> datetime | None:
-    events = data.get("events", [])
+def _parse_event_date(events: list[dict], action_name: str) -> datetime | None:
+    """Extract a datetime from RDAP events[] matching a given eventAction."""
     for ev in events:
-        action = ev.get("eventAction", "").lower()
-        if action == "registration":
-            try:
-                return datetime.fromisoformat(ev["eventDate"].replace("Z", "+00:00"))
-            except (KeyError, ValueError):
-                continue
-    fallback_actions = {"last changed of registration", "registrationdate"}
-    for ev in events:
-        action = ev.get("eventAction", "").lower()
-        if action in fallback_actions:
+        if ev.get("eventAction", "").lower() == action_name:
             try:
                 return datetime.fromisoformat(ev["eventDate"].replace("Z", "+00:00"))
             except (KeyError, ValueError):
@@ -204,9 +199,55 @@ def _parse_registration_date(data: dict) -> datetime | None:
     return None
 
 
+def _parse_rdap_response(data: dict) -> dict:
+    """Extract all useful fields from an RDAP domain response."""
+    events = data.get("events", [])
+
+    # --- Registration date (with fallbacks) ---
+    registered_at = _parse_event_date(events, "registration")
+    if registered_at is None:
+        for fallback in ("last changed of registration", "registrationdate"):
+            registered_at = _parse_event_date(events, fallback)
+            if registered_at is not None:
+                break
+
+    # --- Expiration & last-changed ---
+    expires_at = _parse_event_date(events, "expiration")
+    last_changed_at = _parse_event_date(events, "last changed")
+
+    # --- Registrar name from entities ---
+    registrar = None
+    for entity in data.get("entities", []):
+        roles = [r.lower() for r in entity.get("roles", [])]
+        if "registrar" not in roles:
+            continue
+        vcard = entity.get("vcardArray")
+        if isinstance(vcard, list) and len(vcard) >= 2:
+            for field in vcard[1]:
+                if isinstance(field, list) and len(field) >= 4 and field[0] == "fn":
+                    registrar = field[3]
+                    break
+        if registrar is None:
+            registrar = entity.get("handle")
+        if registrar:
+            break
+
+    # --- Nameservers ---
+    ns_list = data.get("nameservers", [])
+    nameservers = [ns["ldhName"].lower() for ns in ns_list if ns.get("ldhName")] or None
+
+    return {
+        "registered_at": registered_at,
+        "expires_at": expires_at,
+        "last_changed_at": last_changed_at,
+        "registrar": registrar,
+        "nameservers": nameservers,
+    }
+
+
 async def fetch_registration_date(
     client: httpx.AsyncClient, domain: str, server_url: str,
-) -> tuple[str, datetime | None]:
+) -> tuple[str, dict | None]:
     """Query RDAP for a single domain with rate-limited retries."""
     limiter = _get_rate_limiter(server_url)
     url = f"{server_url}/domain/{domain}"
@@ -228,17 +269,16 @@ async def fetch_registration_date(
 
             if resp.status_code == 429:
                 rate_limit_hits += 1
-                retry_after = float(resp.headers.get("Retry-After", _backoff(attempt)))
-                retry_after = min(retry_after, MAX_BACKOFF)
                 # Throttle the limiter so ALL requests to this server slow down
                 limiter.throttle()
                 if rate_limit_hits >= MAX_429_RETRIES:
-                    log.warning("Server %s rate-limiting — skipping %s after %d 429s",
+                    log.warning("Server %s rate-limiting — deferring %s after %d 429s",
                                 server_url, domain, rate_limit_hits)
-                    return (domain, None)
-                log.debug("429 for %s — waiting %.1fs (hit %d/%d)",
-                          domain, retry_after, rate_limit_hits, MAX_429_RETRIES)
-                await asyncio.sleep(retry_after)
+                    return (domain, _RATE_LIMITED)
+                wait = _429_BACKOFF_STEPS[rate_limit_hits - 1]
+                log.debug("429 for %s — waiting %ds (hit %d/%d)",
+                          domain, wait, rate_limit_hits, MAX_429_RETRIES)
+                await asyncio.sleep(wait)
                 continue
 
             if resp.status_code >= 500:
@@ -249,7 +289,7 @@ async def fetch_registration_date(
                 continue
 
             resp.raise_for_status()
-            return (domain, _parse_registration_date(resp.json()))
+            return (domain, _parse_rdap_response(resp.json()))
 
         except Exception as exc:
             delay = _backoff(attempt)
@@ -264,8 +304,8 @@ async def fetch_registration_date(
 
 async def process_batch(
     client: httpx.AsyncClient, domains: list[str],
-) -> tuple[list[tuple[str, datetime]], list[str]]:
-    """Return (found, all_checked) — found has dates, all_checked is every domain we looked up."""
+) -> tuple[list[tuple[str, dict]], list[str]]:
+    """Return (found, all_checked) — found has RDAP info dicts, all_checked is every domain we looked up."""
     tasks = []
     skipped_domains: list[str] = []
     for domain in domains:
@@ -285,19 +325,21 @@ async def process_batch(
         if isinstance(r, Exception):
             log.warning("Unexpected gather exception: %s", r)
             continue
-        domain, dt = r
+        domain, info = r
+        if info is _RATE_LIMITED:
+            continue  # don't mark as checked — retry in a future round
         checked.append(domain)
-        if dt is not None:
-            found.append((domain, dt))
+        if info is not None:
+            found.append((domain, info))
     return found, checked
 
 
 async def update_db(
     pool: asyncpg.Pool,
-    found: list[tuple[str, datetime]],
+    found: list[tuple[str, dict]],
     all_checked: list[str],
 ) -> int:
-    """Batch-update: set registered_at for found, rdap_checked_at for all checked."""
+    """Batch-update: set RDAP fields for found, rdap_checked_at for all checked."""
     if not all_checked:
         return 0
     now = datetime.now(timezone.utc)
@@ -307,8 +349,22 @@ async def update_db(
                 async with conn.transaction():
                     if found:
                         await conn.executemany(
-                            "UPDATE global_domains SET registered_at = $1 WHERE name = $2",
-                            [(dt, domain) for domain, dt in found],
+                            """UPDATE global_domains
+                               SET registered_at = $1, expires_at = $2,
+                                   last_changed_at = $3, registrar = $4,
+                                   nameservers = $5
+                               WHERE name = $6""",
+                            [
+                                (
+                                    info["registered_at"],
+                                    info["expires_at"],
+                                    info["last_changed_at"],
+                                    info["registrar"],
+                                    info["nameservers"],
+                                    domain,
+                                )
+                                for domain, info in found
+                            ],
                         )
                     await conn.executemany(
                         "UPDATE global_domains SET rdap_checked_at = $1 WHERE name = $2",
@@ -460,7 +516,7 @@ class RDAPWorker:
                 domains = [r["name"] for r in rows]
                 self._log(f"Round {self.round_num}: processing {len(domains)} domains")
 
-                all_found: list[tuple[str, datetime]] = []
+                all_found: list[tuple[str, dict]] = []
                 all_checked: list[str] = []
                 for i in range(0, len(domains), WRITE_BATCH):
                     if not self.running:
