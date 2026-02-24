@@ -1,6 +1,7 @@
+import asyncio
 import os
 
-from fastapi import FastAPI
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, JSONResponse
 
 from rdap_lookup import worker
@@ -33,6 +34,11 @@ HTML = """<!DOCTYPE html>
   .header h1 { font-size: 2.5rem; font-weight: 900; letter-spacing: -0.03em; line-height: 1.1; }
   .header h1 span { background: linear-gradient(135deg, var(--blue), var(--purple)); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
   .header p { color: var(--muted); font-size: 1rem; margin-top: 8px; }
+
+  /* Connection indicator */
+  .conn-badge { display: inline-flex; align-items: center; gap: 6px; padding: 4px 12px; border-radius: 100px; font-size: 0.7rem; font-weight: 600; letter-spacing: 0.04em; margin-left: 12px; vertical-align: middle; }
+  .conn-badge.ws { background: #052e16; border: 1px solid #15803d; color: #22c55e; }
+  .conn-badge.poll { background: #451a03; border: 1px solid #92400e; color: #f59e0b; }
 
   /* Status badge */
   .badge { display: inline-flex; align-items: center; gap: 8px; padding: 8px 20px; border-radius: 100px; font-size: 0.85rem; font-weight: 600; letter-spacing: 0.04em; margin-bottom: 32px; }
@@ -90,7 +96,7 @@ HTML = """<!DOCTYPE html>
 <div class="container">
 
   <div class="header">
-    <h1><span>RDAP</span> Domain Lookup</h1>
+    <h1><span>RDAP</span> Domain Lookup <span id="connBadge" class="conn-badge poll">POLLING</span></h1>
     <p>Registration date enrichment for 1.2M domains</p>
   </div>
 
@@ -141,59 +147,124 @@ function formatETA(remaining, rate) {
   return h + 'h ' + m + 'm';
 }
 
-async function refresh() {
+function updateStatus(d) {
+  document.getElementById('done').textContent = fmt(d.done);
+  document.getElementById('checked').textContent = fmt(d.checked);
+  document.getElementById('remaining').textContent = fmt(d.remaining);
+  document.getElementById('total').textContent = fmt(d.total);
+  document.getElementById('rate').textContent = d.rate ? d.rate + '/s' : '-';
+  document.getElementById('session').textContent = fmt(d.total_updated_this_session);
+  document.getElementById('eta').textContent = formatETA(d.remaining, d.rate);
+  document.getElementById('round').textContent = d.round || '-';
+  const pct = d.pct || 0;
+  document.getElementById('bar').style.width = pct + '%';
+  document.getElementById('pctNum').textContent = pct.toFixed(1);
+  const badge = document.getElementById('badge');
+  const badgeText = document.getElementById('badgeText');
+  badge.className = 'badge ' + (d.running ? 'running' : 'stopped');
+  badgeText.textContent = d.running ? 'RUNNING' : 'STOPPED';
+  document.getElementById('startBtn').disabled = d.running;
+  document.getElementById('stopBtn').disabled = !d.running;
+  const errEl = document.getElementById('errorBanner');
+  if (d.error) { errEl.textContent = d.error; errEl.style.display = 'block'; }
+  else { errEl.style.display = 'none'; }
+}
+
+function updateLogs(logs) {
+  const el = document.getElementById('logs');
+  const atBottom = el.scrollTop + el.clientHeight >= el.scrollHeight - 30;
+  el.innerHTML = logs.map(l => '<div>' + l + '</div>').join('');
+  if (atBottom) el.scrollTop = el.scrollHeight;
+}
+
+/* ---------- WebSocket with polling fallback ---------- */
+let ws = null;
+let wsConnected = false;
+let pollTimers = { status: null, logs: null };
+
+function setConnMode(mode) {
+  const el = document.getElementById('connBadge');
+  if (mode === 'ws') {
+    el.className = 'conn-badge ws';
+    el.textContent = 'LIVE';
+  } else {
+    el.className = 'conn-badge poll';
+    el.textContent = 'POLLING';
+  }
+}
+
+function connectWS() {
+  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  ws = new WebSocket(proto + '//' + location.host + '/ws');
+
+  ws.onopen = () => {
+    wsConnected = true;
+    setConnMode('ws');
+    stopPolling();
+  };
+
+  ws.onmessage = (e) => {
+    try {
+      const msg = JSON.parse(e.data);
+      if (msg.status) updateStatus(msg.status);
+      if (msg.logs) updateLogs(msg.logs);
+    } catch(err) {}
+  };
+
+  ws.onclose = () => {
+    wsConnected = false;
+    setConnMode('poll');
+    startPolling();
+    setTimeout(connectWS, 3000);
+  };
+
+  ws.onerror = () => { ws.close(); };
+}
+
+/* Polling fallback */
+async function pollStatus() {
   try {
     const r = await fetch('/api/status');
-    const d = await r.json();
-    document.getElementById('done').textContent = fmt(d.done);
-    document.getElementById('checked').textContent = fmt(d.checked);
-    document.getElementById('remaining').textContent = fmt(d.remaining);
-    document.getElementById('total').textContent = fmt(d.total);
-    document.getElementById('rate').textContent = d.rate ? d.rate + '/s' : '-';
-    document.getElementById('session').textContent = fmt(d.total_updated_this_session);
-    document.getElementById('eta').textContent = formatETA(d.remaining, d.rate);
-    document.getElementById('round').textContent = d.round || '-';
-    const pct = d.pct || 0;
-    document.getElementById('bar').style.width = pct + '%';
-    document.getElementById('pctNum').textContent = pct.toFixed(1);
-    const badge = document.getElementById('badge');
-    const badgeText = document.getElementById('badgeText');
-    badge.className = 'badge ' + (d.running ? 'running' : 'stopped');
-    badgeText.textContent = d.running ? 'RUNNING' : 'STOPPED';
-    document.getElementById('startBtn').disabled = d.running;
-    document.getElementById('stopBtn').disabled = !d.running;
-    const errEl = document.getElementById('errorBanner');
-    if (d.error) { errEl.textContent = d.error; errEl.style.display = 'block'; }
-    else { errEl.style.display = 'none'; }
+    updateStatus(await r.json());
   } catch(e) {}
 }
 
-async function refreshLogs() {
+async function pollLogs() {
   try {
     const r = await fetch('/api/logs');
     const d = await r.json();
-    const el = document.getElementById('logs');
-    const atBottom = el.scrollTop + el.clientHeight >= el.scrollHeight - 30;
-    el.innerHTML = d.logs.map(l => '<div>' + l + '</div>').join('');
-    if (atBottom) el.scrollTop = el.scrollHeight;
+    updateLogs(d.logs);
   } catch(e) {}
 }
 
+function startPolling() {
+  if (!pollTimers.status) pollTimers.status = setInterval(pollStatus, 3000);
+  if (!pollTimers.logs) pollTimers.logs = setInterval(pollLogs, 2000);
+}
+
+function stopPolling() {
+  if (pollTimers.status) { clearInterval(pollTimers.status); pollTimers.status = null; }
+  if (pollTimers.logs) { clearInterval(pollTimers.logs); pollTimers.logs = null; }
+}
+
+/* Controls (always use HTTP for mutations) */
 async function doStart() {
   document.getElementById('startBtn').disabled = true;
   await fetch('/api/start', {method:'POST'});
-  refresh(); refreshLogs();
+  if (!wsConnected) { pollStatus(); pollLogs(); }
 }
 
 async function doStop() {
   document.getElementById('stopBtn').disabled = true;
   await fetch('/api/stop', {method:'POST'});
-  refresh(); refreshLogs();
+  if (!wsConnected) { pollStatus(); pollLogs(); }
 }
 
-setInterval(refresh, 3000);
-setInterval(refreshLogs, 2000);
-refresh(); refreshLogs();
+/* Boot: try WebSocket first, start polling as immediate fallback */
+startPolling();
+pollStatus();
+pollLogs();
+connectWS();
 </script>
 </body>
 </html>"""
@@ -203,6 +274,25 @@ refresh(); refreshLogs();
 async def index():
     return HTML
 
+
+# ---- WebSocket endpoint ----
+
+@app.websocket("/ws")
+async def websocket_endpoint(websocket: WebSocket):
+    await websocket.accept()
+    try:
+        while True:
+            status_data = await worker.get_progress()
+            logs_data = list(worker.logs)
+            await websocket.send_json({"status": status_data, "logs": logs_data})
+            await asyncio.sleep(1.5)
+    except WebSocketDisconnect:
+        pass
+    except Exception:
+        pass
+
+
+# ---- HTTP API (kept as fallback) ----
 
 @app.get("/api/status")
 async def status():

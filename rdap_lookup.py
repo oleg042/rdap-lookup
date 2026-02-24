@@ -6,6 +6,7 @@ import sys
 import time
 from collections import deque
 from datetime import datetime, timezone
+from urllib.parse import urlparse
 
 import asyncpg
 import httpx
@@ -23,8 +24,8 @@ log = logging.getLogger(__name__)
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
 BATCH_SIZE = 500
 WRITE_BATCH = 250
-CONCURRENCY_PER_SERVER = 5
 MAX_RETRIES = 10
+MAX_429_RETRIES = 3           # give up on a domain after 3 rate-limit hits
 BASE_BACKOFF = 1.0           # first retry after ~1s
 MAX_BACKOFF = 120.0           # cap at 2 minutes
 REQUEST_TIMEOUT = 45.0
@@ -35,10 +36,47 @@ MAX_WORKER_CRASHES = 50       # auto-restart up to this many times
 WORKER_CRASH_COOLDOWN = 30.0  # wait 30s before auto-restarting after crash
 
 # ---------------------------------------------------------------------------
+# Per-server rate limits (requests per second)
+# Based on published docs, AUPs, and empirical testing.
+# ---------------------------------------------------------------------------
+DEFAULT_SERVER_RATE = 1.0     # conservative default for unknown servers
+
+_KNOWN_SERVER_RATES: dict[str, float] = {
+    # Verisign — .com, .net, .cc, .name — undisclosed limit, large capacity
+    "rdap.verisign.com": 2.0,
+    # Identity Digital / Donuts — 200+ gTLDs — documented ~10 rps for WHOIS
+    "rdap.identitydigital.services": 5.0,
+    "rdap.donuts.co": 5.0,
+    # Afilias — .info, .org — moderate capacity
+    "rdap.afilias.net": 2.0,
+    "rdap.org.nic.info": 2.0,
+    # CentralNic — 100+ gTLDs — documented 1,800/15min = 2/s
+    "rdap.centralnic.com": 1.5,
+    # Nominet — .uk — documented 5/s but 1K/day cap
+    "rdap.nominet.uk": 3.0,
+    # GMO Registry — .shop etc — undisclosed
+    "rdap.gmoregistry.net": 1.0,
+    # Australian ccTLD — .au, .com.au — very strict, 429s immediately
+    "rdap.cctld.au": 0.5,
+    "rdap.auda.org.au": 0.5,
+    # DENIC — .de — undisclosed, GDPR-strict, pilot RDAP
+    "rdap.denic.de": 1.0,
+    # AFNIC — .fr — undisclosed
+    "rdap.nic.fr": 1.0,
+    # PIR — .org
+    "rdap.publicinterestregistry.org": 2.0,
+    # Neustar/GoDaddy Registry — various gTLDs
+    "rdap.nic.godaddy": 2.0,
+    # Google Registry — .google, .app, .dev, .page etc
+    "rdap.nic.google": 2.0,
+    # Amazon Registry
+    "rdap.nic.amazon": 1.0,
+}
+
+# ---------------------------------------------------------------------------
 # RDAP bootstrap
 # ---------------------------------------------------------------------------
 _tld_to_server: dict[str, str] = {}
-_server_semaphores: dict[str, asyncio.Semaphore] = {}
 
 
 async def load_bootstrap(client: httpx.AsyncClient) -> None:
@@ -76,10 +114,61 @@ def get_rdap_server(domain: str) -> str | None:
     return _tld_to_server.get(tld)
 
 
-def _get_semaphore(server_url: str) -> asyncio.Semaphore:
-    if server_url not in _server_semaphores:
-        _server_semaphores[server_url] = asyncio.Semaphore(CONCURRENCY_PER_SERVER)
-    return _server_semaphores[server_url]
+# ---------------------------------------------------------------------------
+# Per-server rate limiter
+# ---------------------------------------------------------------------------
+class _RateLimiter:
+    """Controls both concurrency and sending rate for a single RDAP server.
+
+    Uses a semaphore for max in-flight requests and a lock-guarded timestamp
+    to enforce minimum spacing between request starts.
+    """
+
+    def __init__(self, rate: float):
+        self.rate = rate
+        # Scale max concurrency with rate: faster servers get more slots
+        self.max_concurrent = max(2, min(int(rate * 3), 8))
+        self._sem = asyncio.Semaphore(self.max_concurrent)
+        self._interval = 1.0 / rate
+        self._last_request_time = 0.0
+        self._lock = asyncio.Lock()
+
+    async def __aenter__(self):
+        await self._sem.acquire()
+        # Enforce minimum spacing between requests
+        async with self._lock:
+            now = time.time()
+            wait = self._interval - (now - self._last_request_time)
+            if wait > 0:
+                await asyncio.sleep(wait)
+            self._last_request_time = time.time()
+        return self
+
+    async def __aexit__(self, *args):
+        self._sem.release()
+
+    def throttle(self) -> None:
+        """Halve the rate after a 429 — minimum 0.1 req/s."""
+        old = self.rate
+        self.rate = max(self.rate * 0.5, 0.1)
+        self._interval = 1.0 / self.rate
+        log.info("Rate for server throttled: %.2f → %.2f req/s", old, self.rate)
+
+
+_rate_limiters: dict[str, _RateLimiter] = {}
+
+
+def _get_rate_limiter(server_url: str) -> _RateLimiter:
+    if server_url not in _rate_limiters:
+        host = urlparse(server_url).hostname or ""
+        rate = DEFAULT_SERVER_RATE
+        for known_host, known_rate in _KNOWN_SERVER_RATES.items():
+            if known_host in host or host in known_host:
+                rate = known_rate
+                break
+        _rate_limiters[server_url] = _RateLimiter(rate)
+        log.info("Rate limiter for %s: %.1f req/s, %d concurrent", host, rate, _rate_limiters[server_url].max_concurrent)
+    return _rate_limiters[server_url]
 
 
 def _backoff(attempt: int) -> float:
@@ -115,13 +204,14 @@ def _parse_registration_date(data: dict) -> datetime | None:
 async def fetch_registration_date(
     client: httpx.AsyncClient, domain: str, server_url: str,
 ) -> tuple[str, datetime | None]:
-    """Query RDAP for a single domain with aggressive retry logic."""
-    sem = _get_semaphore(server_url)
+    """Query RDAP for a single domain with rate-limited retries."""
+    limiter = _get_rate_limiter(server_url)
     url = f"{server_url}/domain/{domain}"
+    rate_limit_hits = 0
 
     for attempt in range(MAX_RETRIES):
         try:
-            async with sem:
+            async with limiter:
                 resp = await client.get(url, timeout=REQUEST_TIMEOUT, follow_redirects=True)
 
             if resp.status_code == 404:
@@ -132,18 +222,24 @@ async def fetch_registration_date(
                 return (domain, None)
 
             if resp.status_code == 429:
+                rate_limit_hits += 1
                 retry_after = float(resp.headers.get("Retry-After", _backoff(attempt)))
                 retry_after = min(retry_after, MAX_BACKOFF)
-                if attempt < 3:
-                    log.debug("429 for %s — backing off %.1fs", domain, retry_after)
-                else:
-                    log.warning("429 for %s — backing off %.1fs (attempt %d/%d)", domain, retry_after, attempt + 1, MAX_RETRIES)
+                # Throttle the limiter so ALL requests to this server slow down
+                limiter.throttle()
+                if rate_limit_hits >= MAX_429_RETRIES:
+                    log.warning("Server %s rate-limiting — skipping %s after %d 429s",
+                                server_url, domain, rate_limit_hits)
+                    return (domain, None)
+                log.debug("429 for %s — waiting %.1fs (hit %d/%d)",
+                          domain, retry_after, rate_limit_hits, MAX_429_RETRIES)
                 await asyncio.sleep(retry_after)
                 continue
 
             if resp.status_code >= 500:
                 delay = _backoff(attempt)
-                log.warning("HTTP %d for %s — retrying in %.1fs (attempt %d/%d)", resp.status_code, domain, delay, attempt + 1, MAX_RETRIES)
+                log.warning("HTTP %d for %s — retrying in %.1fs (attempt %d/%d)",
+                            resp.status_code, domain, delay, attempt + 1, MAX_RETRIES)
                 await asyncio.sleep(delay)
                 continue
 
@@ -153,7 +249,8 @@ async def fetch_registration_date(
         except Exception as exc:
             delay = _backoff(attempt)
             if attempt >= 2:
-                log.warning("Error for %s: %s — retrying in %.1fs (attempt %d/%d)", domain, type(exc).__name__, delay, attempt + 1, MAX_RETRIES)
+                log.warning("Error for %s: %s — retrying in %.1fs (attempt %d/%d)",
+                            domain, type(exc).__name__, delay, attempt + 1, MAX_RETRIES)
             await asyncio.sleep(delay)
 
     log.error("Exhausted %d retries for %s — skipping", MAX_RETRIES, domain)
@@ -387,6 +484,8 @@ class RDAPWorker:
         self.round_num = 0
         self.total_updated = 0
         self.crash_count = 0
+        # Reset rate limiters so throttled rates don't persist across sessions
+        _rate_limiters.clear()
         self.task = asyncio.create_task(self._safe_run())
         return True
 
