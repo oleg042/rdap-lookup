@@ -27,6 +27,9 @@ WRITE_BATCH = 50
 MAX_RETRIES = 10
 MAX_429_RETRIES = 8           # give up on a domain after 8 rate-limit hits
 _429_BACKOFF_STEPS = [1, 3, 5, 10, 10, 10, 30, 60]  # seconds between 429 retries
+COOLDOWN_THRESHOLD = 3        # consecutive _RATE_LIMITED domains before circuit opens
+COOLDOWN_BASE_MINUTES = 5     # first cooldown duration
+COOLDOWN_MAX_MINUTES = 30     # cap escalating cooldowns
 BASE_BACKOFF = 1.0           # first retry after ~1s
 MAX_BACKOFF = 120.0           # cap at 2 minutes
 REQUEST_TIMEOUT = 45.0
@@ -127,12 +130,17 @@ class _RateLimiter:
 
     def __init__(self, rate: float):
         self.rate = rate
+        self._initial_rate = rate
         # Scale max concurrency with rate: faster servers get more slots
         self.max_concurrent = max(2, min(int(rate * 3), 8))
         self._sem = asyncio.Semaphore(self.max_concurrent)
         self._interval = 1.0 / rate
         self._last_request_time = 0.0
         self._lock = asyncio.Lock()
+        # Circuit breaker state
+        self._consecutive_429_domains = 0
+        self._cooldown_until = 0.0
+        self._cooldown_count = 0
 
     async def __aenter__(self):
         await self._sem.acquire()
@@ -154,6 +162,42 @@ class _RateLimiter:
         self.rate = max(self.rate * 0.5, 0.1)
         self._interval = 1.0 / self.rate
         log.info("Rate for server throttled: %.2f → %.2f req/s", old, self.rate)
+
+    def record_rate_limit(self) -> None:
+        """Record a domain that returned _RATE_LIMITED. Opens circuit if threshold hit."""
+        self._consecutive_429_domains += 1
+        if self._consecutive_429_domains >= COOLDOWN_THRESHOLD:
+            self._cooldown_count += 1
+            minutes = min(COOLDOWN_BASE_MINUTES * (2 ** (self._cooldown_count - 1)), COOLDOWN_MAX_MINUTES)
+            self._cooldown_until = time.time() + minutes * 60
+            log.warning(
+                "Circuit breaker OPEN — %d consecutive rate-limited domains, "
+                "cooling down for %d min (trip #%d)",
+                self._consecutive_429_domains, minutes, self._cooldown_count,
+            )
+            self._consecutive_429_domains = 0
+
+    def record_success(self) -> None:
+        """Reset consecutive rate-limit counter on a successful (non-429) result."""
+        self._consecutive_429_domains = 0
+
+    @property
+    def is_cooling_down(self) -> bool:
+        """True if circuit breaker is open. Auto-recovers rate when cooldown expires."""
+        if self._cooldown_until <= 0:
+            return False
+        if time.time() >= self._cooldown_until:
+            self._cooldown_until = 0.0
+            self._recover_rate()
+            return False
+        return True
+
+    def _recover_rate(self) -> None:
+        """Reset rate back to the initial configured value after cooldown."""
+        old = self.rate
+        self.rate = self._initial_rate
+        self._interval = 1.0 / self.rate
+        log.info("Rate recovered: %.2f → %.2f req/s", old, self.rate)
 
 
 _rate_limiters: dict[str, _RateLimiter] = {}
@@ -261,10 +305,12 @@ async def fetch_registration_date(
             _recent_activity.append(f"{domain} · {resp.status_code}")
 
             if resp.status_code == 404:
+                limiter.record_success()
                 return (domain, None)
 
             # 4xx client errors (except 429) = permanent, skip immediately
             if resp.status_code in (400, 403, 410):
+                limiter.record_success()
                 return (domain, None)
 
             if resp.status_code == 429:
@@ -274,6 +320,7 @@ async def fetch_registration_date(
                 if rate_limit_hits >= MAX_429_RETRIES:
                     log.warning("Server %s rate-limiting — deferring %s after %d 429s",
                                 server_url, domain, rate_limit_hits)
+                    limiter.record_rate_limit()
                     return (domain, _RATE_LIMITED)
                 wait = _429_BACKOFF_STEPS[rate_limit_hits - 1]
                 log.debug("429 for %s — waiting %ds (hit %d/%d)",
@@ -289,6 +336,7 @@ async def fetch_registration_date(
                 continue
 
             resp.raise_for_status()
+            limiter.record_success()
             return (domain, _parse_rdap_response(resp.json()))
 
         except Exception as exc:
@@ -299,6 +347,7 @@ async def fetch_registration_date(
             await asyncio.sleep(delay)
 
     log.error("Exhausted %d retries for %s — skipping", MAX_RETRIES, domain)
+    limiter.record_success()
     return (domain, None)
 
 
@@ -308,14 +357,21 @@ async def process_batch(
     """Return (found, all_checked) — found has RDAP info dicts, all_checked is every domain we looked up."""
     tasks = []
     skipped_domains: list[str] = []
+    cooldown_skipped = 0
     for domain in domains:
         server = get_rdap_server(domain)
         if server is None:
             skipped_domains.append(domain)
             continue
+        limiter = _get_rate_limiter(server)
+        if limiter.is_cooling_down:
+            cooldown_skipped += 1
+            continue  # don't mark as checked — retry after cooldown
         tasks.append(fetch_registration_date(client, domain, server))
     if skipped_domains:
         log.info("Skipped %d domains with no known RDAP server", len(skipped_domains))
+    if cooldown_skipped:
+        log.info("Skipped %d domains due to server cooldown", cooldown_skipped)
     if not tasks:
         return [], skipped_domains
     results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -494,7 +550,7 @@ class RDAPWorker:
                         pool = await self._get_pool()
                         async with pool.acquire() as conn:
                             rows = await conn.fetch(
-                                "SELECT name FROM global_domains WHERE rdap_checked_at IS NULL AND redirect_id IS NOT NULL LIMIT $1",
+                                "SELECT name FROM global_domains WHERE rdap_checked_at IS NULL AND redirect_id IS NOT NULL ORDER BY random() LIMIT $1",
                                 BATCH_SIZE,
                             )
                         break
